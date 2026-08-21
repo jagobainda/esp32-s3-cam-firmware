@@ -1,5 +1,7 @@
 #include "camera.h"
 
+#include <stdbool.h>
+
 #include "driver/i2c_master.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -49,6 +51,105 @@ static const char *TAG = "camera";
 #endif
 
 static i2c_master_bus_handle_t s_i2c_bus;
+static int64_t s_night_guard_next_us;
+
+/* ---------------------------------------------------------------------------
+ * Modo nocturno del OV5640.
+ *
+ * AEC_CTRL00 (0x3a00) bit 2 lo habilita: en escenas oscuras el AEC alarga el
+ * frame insertando lineas de relleno (VTS_EXTRA, 0x350c/0x350d) para exponer
+ * mas tiempo. Sale una imagen borrosa y el ritmo se hunde a ~4 FPS. Medido en
+ * hardware: con el activado no pasaba de 3.9 FPS ni subiendo XCLK ni bajando
+ * la calidad JPEG.
+ *
+ * No basta con escribir el bit una vez al arrancar: una escritura SCCB perdida
+ * pasaria inadvertida. Aqui se escribe, se relee para confirmar, y luego se
+ * vigila cada MIRILLA_NIGHT_MODE_GUARD_S segundos. Las lineas extra son el
+ * efecto observable del modo nocturno, asi que se comprueban tambien: si no
+ * son cero el frame ya viene alargado, sea quien sea el que lo hizo.
+ * ------------------------------------------------------------------------ */
+#define OV5640_REG_AEC_CTRL00   0x3a00
+#define OV5640_NIGHT_MODE_BIT   0x04
+#define OV5640_REG_VTS_EXTRA_H  0x350c
+#define OV5640_REG_VTS_EXTRA_L  0x350d
+
+/*
+ * Deja el modo nocturno desactivado. Devuelve true si al salir se ha podido
+ * confirmar por lectura que lo esta; `fixed`, si no es NULL, indica si hubo que
+ * corregir algo (al arrancar es normal, mas tarde significa que habia vuelto).
+ */
+static bool night_mode_force_off(sensor_t *sensor, bool *fixed)
+{
+    if (fixed != NULL) {
+        *fixed = false;
+    }
+    if (sensor == NULL || sensor->get_reg == NULL || sensor->set_reg == NULL) {
+        return false;
+    }
+
+    bool ok = true;
+
+    int aec = sensor->get_reg(sensor, OV5640_REG_AEC_CTRL00, 0xff);
+    if (aec < 0) {
+        ok = false;
+    } else if (aec & OV5640_NIGHT_MODE_BIT) {
+        if (fixed != NULL) {
+            *fixed = true;
+        }
+        if (sensor->set_reg(sensor, OV5640_REG_AEC_CTRL00, OV5640_NIGHT_MODE_BIT, 0) < 0) {
+            ok = false;
+        } else {
+            aec = sensor->get_reg(sensor, OV5640_REG_AEC_CTRL00, 0xff);
+            if (aec < 0 || (aec & OV5640_NIGHT_MODE_BIT) != 0) {
+                ok = false;
+            }
+        }
+    }
+
+    const int extra_h = sensor->get_reg(sensor, OV5640_REG_VTS_EXTRA_H, 0xff);
+    const int extra_l = sensor->get_reg(sensor, OV5640_REG_VTS_EXTRA_L, 0xff);
+    if (extra_h < 0 || extra_l < 0) {
+        ok = false;
+    } else if (extra_h != 0 || extra_l != 0) {
+        if (fixed != NULL) {
+            *fixed = true;
+        }
+        if (sensor->set_reg(sensor, OV5640_REG_VTS_EXTRA_H, 0xff, 0) < 0) {
+            ok = false;
+        }
+        if (sensor->set_reg(sensor, OV5640_REG_VTS_EXTRA_L, 0xff, 0) < 0) {
+            ok = false;
+        }
+    }
+
+    /* Que el status del driver no contradiga al registro. */
+    if (ok) {
+        sensor->status.aec2 = 0;
+    }
+    return ok;
+}
+
+void mirilla_camera_keep_night_mode_off(void)
+{
+#if CONFIG_MIRILLA_NIGHT_MODE_GUARD_S > 0
+    const int64_t now = esp_timer_get_time();
+    if (now < s_night_guard_next_us) {
+        return;
+    }
+    s_night_guard_next_us = now + (int64_t) CONFIG_MIRILLA_NIGHT_MODE_GUARD_S * 1000000LL;
+
+    sensor_t *sensor = esp_camera_sensor_get();
+    bool fixed = false;
+    if (!night_mode_force_off(sensor, &fixed)) {
+        ESP_LOGW(TAG, "no se pudo comprobar el estado del modo nocturno por SCCB");
+    } else if (fixed) {
+        ESP_LOGW(TAG, "el modo nocturno habia reaparecido, forzado a off otra vez");
+    } else {
+        ESP_LOGD(TAG, "vigilancia: modo nocturno sigue off (AEC_CTRL00=0x%02x)",
+                 sensor->get_reg(sensor, OV5640_REG_AEC_CTRL00, 0xff));
+    }
+#endif
+}
 
 const char *mirilla_camera_resolution_str(void)
 {
@@ -130,17 +231,45 @@ esp_err_t mirilla_camera_init(void)
         return ESP_FAIL;
     }
 
-#if CONFIG_MIRILLA_DISABLE_NIGHT_MODE
-    /*
-     * El modo nocturno del OV5640 alarga el frame para exponer mas cuando hay
-     * poca luz, y eso fija el frame rate en ~4 FPS aunque sobre ancho de banda
-     * y pixel clock. Medido en hardware: con el activado el ritmo no pasa de
-     * 3.9 FPS ni subiendo XCLK ni bajando la calidad JPEG.
-     */
-    if (sensor->set_aec2 != NULL && sensor->set_aec2(sensor, 0) == 0) {
-        ESP_LOGI(TAG, "modo nocturno desactivado (ritmo constante sobre exposicion)");
+    /* Reintentos: los primeros accesos SCCB tras configurar el sensor a veces
+       fallan, y de este no queremos quedarnos sin saber si cuajo. */
+    bool night_off = false;
+    for (int attempt = 1; attempt <= 3 && !night_off; attempt++) {
+        night_off = night_mode_force_off(sensor, NULL);
+        if (!night_off) {
+            ESP_LOGW(TAG, "intento %d de desactivar el modo nocturno sin confirmar", attempt);
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+    if (night_off) {
+        ESP_LOGI(TAG, "modo nocturno forzado a off y confirmado por lectura "
+                      "(AEC_CTRL00=0x%02x, VTS extra=%d), revision cada %ds",
+                 sensor->get_reg(sensor, OV5640_REG_AEC_CTRL00, 0xff),
+                 (sensor->get_reg(sensor, OV5640_REG_VTS_EXTRA_H, 0xff) << 8) |
+                     sensor->get_reg(sensor, OV5640_REG_VTS_EXTRA_L, 0xff),
+                 CONFIG_MIRILLA_NIGHT_MODE_GUARD_S);
     } else {
-        ESP_LOGW(TAG, "no se pudo desactivar el modo nocturno");
+        ESP_LOGE(TAG, "modo nocturno NO confirmado como off: en escenas oscuras "
+                      "el sensor puede alargar el frame y hundir el ritmo");
+    }
+    s_night_guard_next_us = esp_timer_get_time() +
+                            (int64_t) CONFIG_MIRILLA_NIGHT_MODE_GUARD_S * 1000000LL;
+
+#if CONFIG_MIRILLA_ROTATE_180
+    /*
+     * La placa va montada boca abajo en la mirilla, asi que la imagen sale
+     * invertida. Un giro de 180 grados es vflip + hmirror, y el OV5640 los
+     * aplica en su propio ISP antes de comprimir: son escrituras I2C una sola
+     * vez al arrancar, sin coste por frame ni perdida de calidad. La
+     * alternativa (girarlo en el servidor) obligaria a descodificar y
+     * recomprimir cada JPEG de 1080p.
+     */
+    if (sensor->set_vflip == NULL || sensor->set_hmirror == NULL) {
+        ESP_LOGW(TAG, "el sensor no expone vflip/hmirror, imagen sin girar");
+    } else if (sensor->set_vflip(sensor, 1) != 0 || sensor->set_hmirror(sensor, 1) != 0) {
+        ESP_LOGW(TAG, "no se pudo girar la imagen 180 grados en el sensor");
+    } else {
+        ESP_LOGI(TAG, "imagen girada 180 grados en el sensor (vflip + hmirror)");
     }
 #endif
 
