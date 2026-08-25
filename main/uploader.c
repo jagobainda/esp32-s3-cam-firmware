@@ -186,9 +186,9 @@ static void uploader_task(void *arg)
             stats_reset(&stats, now_us);
         }
 
-        /* Al final del ciclo, no entre captura y subida: si toca revisar el
-           modo nocturno, el I2C se come tiempo de espera y no de latencia. */
-        mirilla_camera_keep_night_mode_off();
+        /* Al final del ciclo, no entre captura y subida: si toca revisar la
+           exposicion, el I2C se come tiempo de espera y no de latencia. */
+        mirilla_camera_keep_exposure_policy();
 
         /* Ritmo objetivo: dormimos solo lo que sobre del periodo. */
         const int64_t spent_us = esp_timer_get_time() - cycle_start_us;

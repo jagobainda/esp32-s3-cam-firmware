@@ -13,12 +13,14 @@ esp_err_t mirilla_camera_init(void);
 const char *mirilla_camera_resolution_str(void);
 
 /**
- * Reafirma que el modo nocturno del sensor sigue desactivado. Pensada para
- * llamarse desde el bucle de captura en cada frame: internamente solo toca el
- * bus SCCB una vez cada MIRILLA_NIGHT_MODE_GUARD_S segundos, y en el caso
- * normal la comprobacion son dos lecturas de registro sin escritura.
+ * Reafirma que el bloque AEC/AGC del sensor sigue con la politica de
+ * exposicion configurada (modo dia o noche, techos de exposicion y ganancia,
+ * objetivo y ventana de medicion). Pensada para llamarse desde el bucle de
+ * captura en cada frame: internamente solo toca el bus SCCB una vez cada
+ * MIRILLA_EXPOSURE_GUARD_S segundos, y en el caso normal la comprobacion son
+ * lecturas de registro sin escritura.
  */
-void mirilla_camera_keep_night_mode_off(void);
+void mirilla_camera_keep_exposure_policy(void);
 
 /**
  * Captura en bucle durante `seconds` sin subir nada y registra el ritmo puro
