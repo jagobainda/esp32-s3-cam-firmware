@@ -4,5 +4,6 @@ idf_component_register(
         "wifi.c"
         "camera.c"
         "uploader.c"
+        "telemetry.c"
     INCLUDE_DIRS "."
 )

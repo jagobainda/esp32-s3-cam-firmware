@@ -13,6 +13,7 @@
 #include "sdkconfig.h"
 
 #include "camera.h"
+#include "telemetry.h"
 #include "wifi.h"
 
 static const char *TAG = "uploader";
@@ -38,6 +39,11 @@ static void stats_reset(stats_t *s, int64_t now_us)
     s->window_start_us = now_us;
     s->bytes_min = UINT32_MAX;
 }
+
+/* Acumulados de toda la vida del programa, no de la ventana: la ventana se
+   reinicia cada MIRILLA_STATS_WINDOW_S y el servidor quiere el total. */
+static uint32_t s_total_ok;
+static uint32_t s_total_failed;
 
 static void stats_report(const stats_t *s, int64_t now_us)
 {
@@ -66,6 +72,19 @@ static void stats_report(const stats_t *s, int64_t now_us)
              mbps,
              s->frames_ok ? (double) s->capture_us / s->frames_ok / 1000.0 : 0.0,
              s->frames_ok ? (double) s->upload_us / s->frames_ok / 1000.0 : 0.0);
+
+    /* Los mismos numeros que acaban de ir al log viajan al servidor en la
+       cabecera del siguiente frame, que es donde alguien los va a ver. */
+    const mirilla_telemetry_loop_t loop = {
+        .fps = (float) fps,
+        .capture_ms = s->frames_ok
+            ? (uint32_t) (s->capture_us / s->frames_ok / 1000) : 0,
+        .upload_ms = s->frames_ok
+            ? (uint32_t) (s->upload_us / s->frames_ok / 1000) : 0,
+        .frames_ok = s_total_ok,
+        .frames_failed = s_total_failed,
+    };
+    mirilla_telemetry_set_loop(&loop);
 }
 
 /* Descarta el cuerpo de la respuesta; solo nos interesa el codigo de estado. */
@@ -101,6 +120,15 @@ static esp_http_client_handle_t make_client(void)
 
     esp_http_client_set_header(client, "Content-Type", "image/jpeg");
     esp_http_client_set_header(client, "X-API-Key", CONFIG_MIRILLA_API_KEY);
+
+    /* Los datos de placa no cambian nunca, asi que basta fijar la cabecera una
+       vez: el cliente conserva la lista entre peticiones y la reenvia en todas
+       sin volver a gastar CPU en componerla. */
+    char board[MIRILLA_TELEMETRY_HEADER_MAX];
+    if (mirilla_telemetry_board(board, sizeof(board)) > 0) {
+        esp_http_client_set_header(client, MIRILLA_TELEMETRY_HEADER_BOARD, board);
+        ESP_LOGI(TAG, "telemetria de placa: %s", board);
+    }
 
     ESP_LOGI(TAG, "destino: %s", url);
     return client;
@@ -144,8 +172,17 @@ static void uploader_task(void *arg)
         if (fb == NULL) {
             ESP_LOGE(TAG, "esp_camera_fb_get devolvio NULL");
             stats.frames_failed++;
+            s_total_failed++;
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
+        }
+
+        /* Justo antes del envio, para que el dato sea lo mas fresco posible.
+           La latencia de subida es la excepcion: describe la ventana anterior,
+           porque la de este frame todavia no ha ocurrido. */
+        char device[MIRILLA_TELEMETRY_HEADER_MAX];
+        if (mirilla_telemetry_device(device, sizeof(device)) > 0) {
+            esp_http_client_set_header(client, MIRILLA_TELEMETRY_HEADER_DEVICE, device);
         }
 
         esp_http_client_set_post_field(client, (const char *) fb->buf, fb->len);
@@ -159,6 +196,7 @@ static void uploader_task(void *arg)
 
         if (err == ESP_OK && status >= 200 && status < 300) {
             stats.frames_ok++;
+            s_total_ok++;
             stats.bytes += len;
             if (len < stats.bytes_min) stats.bytes_min = len;
             if (len > stats.bytes_max) stats.bytes_max = len;
@@ -171,6 +209,7 @@ static void uploader_task(void *arg)
                      (uploaded_us - captured_us) / 1000);
         } else {
             stats.frames_failed++;
+            s_total_failed++;
             ESP_LOGE(TAG, "frame %lu: %lu bytes, fallo de subida (%s, HTTP %d)",
                      (unsigned long) frame_index, (unsigned long) len,
                      esp_err_to_name(err), status);

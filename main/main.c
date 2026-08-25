@@ -20,6 +20,7 @@
 #include "sdkconfig.h"
 
 #include "camera.h"
+#include "telemetry.h"
 #include "uploader.h"
 #include "wifi.h"
 
@@ -64,6 +65,8 @@ void app_main(void)
     ESP_ERROR_CHECK(check_psram());
     ESP_ERROR_CHECK(mirilla_camera_init());
     mirilla_camera_benchmark(CONFIG_MIRILLA_CAPTURE_BENCHMARK_S);
+
+    ESP_ERROR_CHECK(mirilla_telemetry_init());
 
     ESP_ERROR_CHECK(mirilla_wifi_start());
     ESP_ERROR_CHECK(mirilla_uploader_start());
