@@ -83,12 +83,29 @@ static int64_t s_exposure_guard_next_us;
  * del datasheet, las mismas que usa drivers/media/i2c/ov5640.c en Linux) y se
  * elige que hace el sensor cuando se queda sin luz:
  *
- *   MODO DIA    modo nocturno off, el frame nunca se alarga. FPS estable y
- *               escena oscura cuando no hay luz suficiente. Es lo que habia.
- *   MODO NOCHE  modo nocturno on, pero con el techo acotado a
- *               MIRILLA_MAX_EXPOSURE_MS: el AEC puede alargar el frame con
- *               lineas de relleno hasta ese limite, asi que el ritmo solo baja
- *               cuando hace falta y nunca por debajo de 1000/MAX_EXPOSURE_MS.
+ *   MODO DIA    modo nocturno off, el frame nunca se alarga: dura siempre
+ *               HTS x VTS. El ritmo es fijo pase lo que pase. Es el default.
+ *   MODO NOCHE  modo nocturno on: el AEC alarga el frame con lineas de
+ *               relleno para exponer mas tiempo. Cuesta FPS de verdad.
+ *
+ * Sobre el coste del modo noche, porque este comentario decia lo contrario y
+ * costo 2.5 FPS: el techo de exposicion NO es un suelo de FPS.
+ *
+ *   1) A 1080p el driver DVP entrega un frame de cada DOS del sensor. Medido
+ *      con el benchmark de captura pura en esta placa: frame de 84.63ms
+ *      (11.81 FPS de sensor) y llegan 169ms clavados, min = max, 5.81 FPS.
+ *      Alargar el frame del sensor 1ms cuesta 2ms de periodo.
+ *   2) El bucle de subida es secuencial (esperar frame, subirlo), asi que
+ *      encima el periodo es entrega + subida, no el mayor de los dos.
+ *
+ * De ahi salieron los 2.5 FPS: con el techo en 150ms el sensor se iba a ~200ms
+ * de frame, el DVP lo doblaba a 400ms y el bucle quedaba clavado en 2.5. El
+ * suelo real del modo noche no es 1000/MAX_EXPOSURE_MS, es la mitad.
+ *
+ * Por eso el techo se recorta al periodo del FPS objetivo dividido por esa
+ * relacion, y por eso la duracion real del frame se lee del sensor y viaja en
+ * la telemetria: con la placa montada en la puerta no hay USB, y sin ese dato
+ * esto se manifiesta como un FPS bajo sin causa aparente.
  *
  * Registros implicados, todos del datasheet del OV5640:
  *   0x3034..0x3037, 0x3108  divisores del PLL, para calcular SYSCLK
@@ -142,6 +159,13 @@ static int64_t s_exposure_guard_next_us;
 
 /* El techo de exposicion y el VTS son campos de 12 bits en el sensor. */
 #define OV5640_MAX_EXPOSURE_LINES   0x0fff
+/*
+ * Frames del sensor por cada frame que entrega el driver DVP. A 1080p es 2,
+ * medido: el sensor va a 84.63ms y esp_camera_fb_get() devuelve uno cada
+ * 169ms, sin dispersion. Es lo que convierte la duracion del frame en el techo
+ * de FPS del aparato entero.
+ */
+#define MIRILLA_SENSOR_FRAMES_PER_CAPTURE 2
 /* Ganancia real en formato 6.4: 16 unidades = 1x, tope del registro 0x3ff. */
 #define OV5640_GAIN_UNITS_PER_X     16
 #define OV5640_MAX_GAIN_UNITS       0x03ff
@@ -172,6 +196,7 @@ typedef struct {
 } exposure_mode_t;
 
 static exposure_mode_t s_mode;
+static mirilla_camera_aec_t s_aec;
 
 static int reg_read8(sensor_t *sensor, uint16_t reg)
 {
@@ -272,10 +297,29 @@ static bool exposure_mode_read(sensor_t *sensor, exposure_mode_t *mode)
      * Techo de exposicion. En modo dia no tiene sentido pedir mas de un frame:
      * el sensor no puede exponer mas de VTS-4 lineas sin alargarlo, y
      * alargarlo es precisamente lo que hace el modo nocturno.
+     *
+     * En modo noche el recorte es el periodo del FPS objetivo repartido entre
+     * los frames de sensor que cuesta cada captura. No garantiza ese ritmo (la
+     * subida va detras, en el mismo bucle), pero impide lo que no tiene
+     * defensa posible: pedir una exposicion que por si sola ya se pasa del
+     * periodo objetivo.
      */
     uint32_t lines = (uint32_t) CONFIG_MIRILLA_MAX_EXPOSURE_MS * 1000000UL / mode->line_ns;
     if (!MIRILLA_NIGHT_MODE && lines > (uint32_t) mode->vts - 4) {
         lines = (uint32_t) mode->vts - 4;
+    }
+    if (MIRILLA_NIGHT_MODE) {
+        const uint32_t budget_us = 1000000UL / (uint32_t) CONFIG_MIRILLA_TARGET_FPS
+                                   / MIRILLA_SENSOR_FRAMES_PER_CAPTURE;
+        const uint32_t budget_lines = budget_us * 1000UL / mode->line_ns;
+        if (lines > budget_lines) {
+            ESP_LOGW(TAG, "techo de exposicion recortado de %ums a %lums: a %d FPS cada "
+                          "captura son %d frames de sensor, y la subida va despues",
+                     (unsigned) CONFIG_MIRILLA_MAX_EXPOSURE_MS,
+                     (unsigned long) (budget_us / 1000), CONFIG_MIRILLA_TARGET_FPS,
+                     MIRILLA_SENSOR_FRAMES_PER_CAPTURE);
+            lines = budget_lines;
+        }
     }
     if (lines > OV5640_MAX_EXPOSURE_LINES) {
         lines = OV5640_MAX_EXPOSURE_LINES;
@@ -415,8 +459,13 @@ static bool exposure_policy_apply(sensor_t *sensor, bool *fixed)
  * sale oscura porque no hay luz o porque el control esta topado: si exposicion
  * y ganancia estan en su techo y la media medida sigue por debajo del
  * objetivo, es lo segundo y hay margen subiendo los techos.
+ *
+ * `frame_ms` es ademas el unico sitio donde se ve la duracion real del frame,
+ * que es lo que fija el techo de FPS de todo el aparato. Por eso esto se lee
+ * siempre, se registre o no en el log: viaja en la telemetria, y con la placa
+ * montada en la puerta la telemetria es la unica ventana que hay.
  */
-static void exposure_log_state(sensor_t *sensor)
+static void exposure_sample_state(sensor_t *sensor)
 {
     /*
      * 0x3501/0x3502 son los 16 bits bajos del campo de 20: lineas en los 12
@@ -428,6 +477,7 @@ static void exposure_log_state(sensor_t *sensor)
     const int vts_extra = reg_read16(sensor, OV5640_REG_VTS_EXTRA);
     const int avg = reg_read8(sensor, OV5640_REG_AVG_READOUT);
     if (exposure < 0 || gain < 0 || vts_extra < 0 || avg < 0) {
+        s_aec.valid = false;
         ESP_LOGW(TAG, "no se pudo leer el estado del AEC por SCCB");
         return;
     }
@@ -437,6 +487,14 @@ static void exposure_log_state(sensor_t *sensor)
     const uint32_t frame_us = exposure_lines_to_us((uint32_t) s_mode.vts + (uint32_t) vts_extra);
     const uint32_t gain_x100 = (uint32_t) (gain & 0x03ff) * 100 / OV5640_GAIN_UNITS_PER_X;
 
+    s_aec.exposure_ms = (uint16_t) ((exposure_us + 500) / 1000);
+    s_aec.ceiling_ms = (uint16_t) ((ceiling_us + 500) / 1000);
+    s_aec.frame_ms = (uint16_t) ((frame_us + 500) / 1000);
+    s_aec.gain_x100 = (uint16_t) gain_x100;
+    s_aec.avg = (uint8_t) avg;
+    s_aec.valid = true;
+
+#if CONFIG_MIRILLA_EXPOSURE_LOG
     ESP_LOGI(TAG,
              "AEC: exposicion %lu.%02lu ms de %lu.%02lu ms, ganancia %lu.%02lux de %dx, "
              "media medida %d/255, frame %lu.%02lu ms (%lu.%02lu FPS)",
@@ -447,6 +505,14 @@ static void exposure_log_state(sensor_t *sensor)
              (unsigned long) frame_us / 1000, (unsigned long) (frame_us % 1000) / 10,
              (unsigned long) (frame_us ? 1000000UL / frame_us : 0),
              (unsigned long) (frame_us ? (100000000UL / frame_us) % 100 : 0));
+#endif
+}
+
+void mirilla_camera_aec(mirilla_camera_aec_t *out)
+{
+    if (out != NULL) {
+        *out = s_aec;
+    }
 }
 
 void mirilla_camera_keep_exposure_policy(void)
@@ -470,9 +536,7 @@ void mirilla_camera_keep_exposure_policy(void)
         ESP_LOGW(TAG, "la politica de exposicion habia cambiado, reescrita (modo %s)",
                  MIRILLA_EXPOSURE_STR);
     }
-#if CONFIG_MIRILLA_EXPOSURE_LOG
-    exposure_log_state(sensor);
-#endif
+    exposure_sample_state(sensor);
 #endif
 }
 
@@ -664,6 +728,6 @@ void mirilla_camera_benchmark(int seconds)
        con que exposicion y ganancia se ha quedado. */
     sensor_t *sensor = esp_camera_sensor_get();
     if (sensor != NULL && s_mode.line_ns != 0) {
-        exposure_log_state(sensor);
+        exposure_sample_state(sensor);
     }
 }
