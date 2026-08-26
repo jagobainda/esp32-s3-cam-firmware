@@ -148,6 +148,21 @@ size_t mirilla_telemetry_device(char *out, size_t len)
                             ap.rssi, (unsigned) ap.primary);
     }
 
+    /*
+     * Estado del AEC. Es lo que explica un FPS bajo sin tocar nada mas: el
+     * ritmo no puede pasar de 1000/frm, y si exp ha llegado a expmax con la
+     * ganancia arriba y avg por debajo del objetivo, el control esta topado.
+     * Sin esto habria que abrir la puerta y enchufar el USB para verlo.
+     */
+    mirilla_camera_aec_t aec;
+    mirilla_camera_aec(&aec);
+    if (aec.valid) {
+        written += snprintf(out + written, len - written,
+                            "exp=%u;expmax=%u;frm=%u;gain=%u.%02u;avg=%u;",
+                            aec.exposure_ms, aec.ceiling_ms, aec.frame_ms,
+                            aec.gain_x100 / 100, aec.gain_x100 % 100, aec.avg);
+    }
+
     written += snprintf(
         out + written, len - written,
         "heap=%" PRIu32 ";heapmin=%" PRIu32 ";psram=%u;up=%lld;"
