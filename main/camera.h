@@ -19,6 +19,14 @@
  * El resto distingue "no hay luz" de "el control esta topado": con
  * exposure_ms == ceiling_ms, la ganancia en su techo y `avg` todavia por
  * debajo de MIRILLA_AEC_TARGET, el AEC ha hecho lo que ha podido.
+ *
+ * `manual` y `ctrl00` son los dos registros que, si alguien los deja mal,
+ * hacen que la imagen se quede congelada sin que ningun otro dato lo delate:
+ * con 0x3503 distinto de cero el AEC/AGC esta en manual y no regula por mucho
+ * que cambie la luz, y 0x3a00 dice si el modo nocturno y el filtro de banda
+ * estan como se pidieron. Se leen aqui porque con la placa en la puerta no hay
+ * USB y "hay que reiniciar para que vuelva a exponer bien" solo se puede
+ * confirmar o descartar mirandolos.
  */
 typedef struct {
     bool valid;           /* false mientras no se haya podido leer por SCCB */
@@ -27,6 +35,8 @@ typedef struct {
     uint16_t frame_ms;    /* duracion real del frame */
     uint16_t gain_x100;   /* ganancia analogica, x100 (1250 = 12.5x) */
     uint8_t avg;          /* media medida en la ventana del AEC, 0-255 */
+    uint8_t manual;       /* 0x3503: 0 = AEC y AGC automaticos */
+    uint8_t ctrl00;       /* 0x3a00: bit 2 modo nocturno, bit 5 filtro de banda */
 } mirilla_camera_aec_t;
 
 /**

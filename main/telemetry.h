@@ -27,10 +27,11 @@
 
 /**
  * Holgura suficiente para las dos cadenas con todos los campos presentes.
- * El peor caso de X-Mirilla-Device ronda los 200 bytes con el estado del AEC
- * incluido; con las dos cabeceras y el resto de la peticion se anda por los
- * 520 bytes, muy por debajo de los 1024 de buffer_size_tx del cliente HTTP,
- * que es la frontera que importa (ver el aviso de arriba).
+ * El peor caso de X-Mirilla-Device ronda los 215 bytes con el estado del AEC
+ * y sus dos registros de diagnostico incluidos; con las dos cabeceras y el
+ * resto de la peticion se anda por los 535 bytes, muy por debajo de los 1024
+ * de buffer_size_tx del cliente HTTP, que es la frontera que importa (ver el
+ * aviso de arriba).
  */
 #define MIRILLA_TELEMETRY_HEADER_MAX 288
 

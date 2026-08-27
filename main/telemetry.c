@@ -153,14 +153,22 @@ size_t mirilla_telemetry_device(char *out, size_t len)
      * ritmo no puede pasar de 1000/frm, y si exp ha llegado a expmax con la
      * ganancia arriba y avg por debajo del objetivo, el control esta topado.
      * Sin esto habria que abrir la puerta y enchufar el USB para verlo.
+     *
+     * `man` y `a00` son los dos registros crudos que separan "el AEC esta
+     * regulando y no hay luz" de "el AEC no esta regulando": man distinto de
+     * 0 es AEC/AGC en manual, y a00 dice si el modo nocturno y el filtro de
+     * banda siguen como se pidieron. Van en decimal por brevedad; el bit del
+     * modo nocturno de a00 es el 4 (a00 & 4).
      */
     mirilla_camera_aec_t aec;
     mirilla_camera_aec(&aec);
     if (aec.valid) {
         written += snprintf(out + written, len - written,
-                            "exp=%u;expmax=%u;frm=%u;gain=%u.%02u;avg=%u;",
+                            "exp=%u;expmax=%u;frm=%u;gain=%u.%02u;avg=%u;"
+                            "man=%u;a00=%u;",
                             aec.exposure_ms, aec.ceiling_ms, aec.frame_ms,
-                            aec.gain_x100 / 100, aec.gain_x100 % 100, aec.avg);
+                            aec.gain_x100 / 100, aec.gain_x100 % 100, aec.avg,
+                            aec.manual, aec.ctrl00);
     }
 
     written += snprintf(

@@ -112,6 +112,7 @@ static int64_t s_exposure_guard_next_us;
  *   0x3808/0x380a           tamano de salida (para la ventana de medicion)
  *   0x380c/0x380e           HTS / VTS del modo actual
  *   0x3500..0x3502          exposicion en lineas (20 bits, 4 de fraccion)
+ *   0x3503                  AEC/AGC en manual (distinto de 0 = no regula)
  *   0x350a/0x350b           ganancia real, formato 6.4 (16 unidades = 1x)
  *   0x350c/0x350d           lineas de relleno que anade el modo nocturno
  *   0x3a00                  bit 2 modo nocturno, bit 5 filtro de banda
@@ -129,6 +130,7 @@ static int64_t s_exposure_guard_next_us;
 #define OV5640_REG_SC_PLL_CTRL3     0x3037
 #define OV5640_REG_SYS_ROOT_DIV     0x3108
 #define OV5640_REG_EXPOSURE_MID     0x3501
+#define OV5640_REG_AEC_PK_MANUAL    0x3503
 #define OV5640_REG_GAIN             0x350a
 #define OV5640_REG_VTS_EXTRA        0x350c
 #define OV5640_REG_X_OUTPUT_SIZE    0x3808
@@ -419,22 +421,65 @@ static bool exposure_policy_apply(sensor_t *sensor, bool *fixed)
     /*
      * Ventana de medicion. El AEC promedia esta region y la compara con el
      * objetivo; por defecto abarca el frame entero, y en la mirilla eso es
-     * medir sobre todo el negro que rodea al circulo de la optica. Un cuadrado
-     * centrado del tamano del circulo hace que el AEC regule por la escena de
-     * verdad en vez de quedarse pegado al techo.
+     * medir sobre todo el negro que rodea al circulo de la optica.
+     *
+     * Aqui esta el detalle que se llevo por delante la exposicion del modo
+     * dia, asi que conviene dejarlo escrito con numeros. El circulo util no es
+     * "aproximadamente el centro del frame": el servidor lo tiene medido para
+     * su mascara de deteccion (MOTION_ROI_CX/CY/R en storage.py) y a 1080p son
+     *
+     *   centro (960, 508) y radio 227 px  ->  un disco de 161.879 px
+     *
+     * o sea que esta 32 px por encima del centro del frame. Con la ventana en
+     * el 55% del alto (594x594 = 352.836 px) solo el 46% de lo que promedia el
+     * AEC es imagen; el 54% restante es el tunel negro de la mirilla, que no
+     * se aclara por mucho que se exponga. Para que la media de la VENTANA
+     * llegue al objetivo, la media del DISCO tiene que subir a
+     *
+     *   objetivo / 0.459 = 64 -> 139 de 255
+     *
+     * y eso es exactamente lo que se veia: de dia el AEC quema el circulo
+     * entero persiguiendo un 139 que solo alcanza saturando, y al anochecer
+     * pide un 139 que no existe, se clava en el techo de exposicion y de
+     * ganancia y deja de regular. El mismo error explica las dos cosas.
+     *
+     * La ventana correcta es el cuadrado inscrito en el disco. Sin
+     * desplazamiento vertical el lado maximo que cabe entero es 280 px (26%
+     * del alto): la esquina peor cae a 221.8 px del centro del disco, dentro
+     * de los 227 de radio. Centrandola de verdad en y=508 caben 227*raiz(2) =
+     * 321 px (30%), que es lo que da MIRILLA_METER_OFFSET_Y_PCT.
+     *
+     * Ese offset va aparte y por defecto a 0 a proposito: con vflip+hmirror
+     * activos no esta escrito en ningun sitio si las coordenadas del bloque
+     * AVG son anteriores o posteriores al giro, y con el lado por defecto la
+     * ventana cae dentro del disco con cualquiera de los dos signos. Para
+     * afinarlo hay que medirlo: subir el offset y mirar si `avg` sube o baja.
      */
 #if CONFIG_MIRILLA_METER_CENTER_PCT > 0
     uint32_t side = (uint32_t) s_mode.out_h * CONFIG_MIRILLA_METER_CENTER_PCT / 100;
     if (side > s_mode.out_w) {
         side = s_mode.out_w;
     }
+    if (side > s_mode.out_h) {
+        side = s_mode.out_h;
+    }
     if (side < 16) {
         side = 16;
     }
+
+    /* Centrada, y luego desplazada en vertical sin salirse del frame. */
+    int32_t y_start = ((int32_t) s_mode.out_h - (int32_t) side) / 2
+                      + (int32_t) s_mode.out_h * CONFIG_MIRILLA_METER_OFFSET_Y_PCT / 100;
+    if (y_start < 0) {
+        y_start = 0;
+    }
+    if (y_start > (int32_t) (s_mode.out_h - side)) {
+        y_start = (int32_t) (s_mode.out_h - side);
+    }
+
     ok &= reg_ensure(sensor, OV5640_REG_AVG_X_START, 0xffff,
                      (uint16_t) ((s_mode.out_w - side) / 2), fixed);
-    ok &= reg_ensure(sensor, OV5640_REG_AVG_Y_START, 0xffff,
-                     (uint16_t) ((s_mode.out_h - side) / 2), fixed);
+    ok &= reg_ensure(sensor, OV5640_REG_AVG_Y_START, 0xffff, (uint16_t) y_start, fixed);
     ok &= reg_ensure(sensor, OV5640_REG_AVG_X_WINDOW, 0xffff, (uint16_t) side, fixed);
     ok &= reg_ensure(sensor, OV5640_REG_AVG_Y_WINDOW, 0xffff, (uint16_t) side, fixed);
 #endif
@@ -476,7 +521,9 @@ static void exposure_sample_state(sensor_t *sensor)
     const int gain = reg_read16(sensor, OV5640_REG_GAIN);
     const int vts_extra = reg_read16(sensor, OV5640_REG_VTS_EXTRA);
     const int avg = reg_read8(sensor, OV5640_REG_AVG_READOUT);
-    if (exposure < 0 || gain < 0 || vts_extra < 0 || avg < 0) {
+    const int manual = reg_read8(sensor, OV5640_REG_AEC_PK_MANUAL);
+    const int ctrl00 = reg_read8(sensor, OV5640_REG_AEC_CTRL00);
+    if (exposure < 0 || gain < 0 || vts_extra < 0 || avg < 0 || manual < 0 || ctrl00 < 0) {
         s_aec.valid = false;
         ESP_LOGW(TAG, "no se pudo leer el estado del AEC por SCCB");
         return;
@@ -492,19 +539,35 @@ static void exposure_sample_state(sensor_t *sensor)
     s_aec.frame_ms = (uint16_t) ((frame_us + 500) / 1000);
     s_aec.gain_x100 = (uint16_t) gain_x100;
     s_aec.avg = (uint8_t) avg;
+    s_aec.manual = (uint8_t) manual;
+    s_aec.ctrl00 = (uint8_t) ctrl00;
     s_aec.valid = true;
+
+    /*
+     * Nadie de este proyecto escribe 0x3503, asi que si algun dia sale
+     * distinto de cero es que lo ha hecho el driver (set_exposure_ctrl o
+     * set_gain_ctrl) y el AEC lleva congelado desde entonces: la imagen se
+     * queda como estaba pase lo que pase con la luz. Merece un aviso propio
+     * porque es la unica averia que no se distingue de "no hay luz" mirando
+     * exposicion y ganancia.
+     */
+    if (manual != 0) {
+        ESP_LOGW(TAG, "0x3503 = 0x%02x: el AEC/AGC esta en MANUAL y no va a regular", manual);
+    }
 
 #if CONFIG_MIRILLA_EXPOSURE_LOG
     ESP_LOGI(TAG,
              "AEC: exposicion %lu.%02lu ms de %lu.%02lu ms, ganancia %lu.%02lux de %dx, "
-             "media medida %d/255, frame %lu.%02lu ms (%lu.%02lu FPS)",
+             "media medida %d/255 (objetivo %d), frame %lu.%02lu ms (%lu.%02lu FPS), "
+             "0x3503=0x%02x 0x3a00=0x%02x",
              (unsigned long) exposure_us / 1000, (unsigned long) (exposure_us % 1000) / 10,
              (unsigned long) ceiling_us / 1000, (unsigned long) (ceiling_us % 1000) / 10,
              (unsigned long) gain_x100 / 100, (unsigned long) gain_x100 % 100,
-             CONFIG_MIRILLA_GAIN_CEILING_X, avg,
+             CONFIG_MIRILLA_GAIN_CEILING_X, avg, CONFIG_MIRILLA_AEC_TARGET,
              (unsigned long) frame_us / 1000, (unsigned long) (frame_us % 1000) / 10,
              (unsigned long) (frame_us ? 1000000UL / frame_us : 0),
-             (unsigned long) (frame_us ? (100000000UL / frame_us) % 100 : 0));
+             (unsigned long) (frame_us ? (100000000UL / frame_us) % 100 : 0),
+             manual, ctrl00);
 #endif
 }
 
@@ -639,15 +702,34 @@ esp_err_t mirilla_camera_init(void)
                  (unsigned long) exposure_lines_to_us(s_mode.vts) / 1000,
                  (unsigned long) (exposure_lines_to_us(s_mode.vts) % 1000) / 10);
         ESP_LOGI(TAG, "exposicion en modo %s: techo %lu.%02lu ms (%u lineas), ganancia hasta %dx, "
-                      "objetivo AEC %d/255, medicion %s, filtro de banda %s, revision cada %ds",
+                      "objetivo AEC %d/255, filtro de banda %s, revision cada %ds",
                  MIRILLA_EXPOSURE_STR,
                  (unsigned long) exposure_lines_to_us(s_mode.max_exposure_lines) / 1000,
                  (unsigned long) (exposure_lines_to_us(s_mode.max_exposure_lines) % 1000) / 10,
                  s_mode.max_exposure_lines, CONFIG_MIRILLA_GAIN_CEILING_X,
                  CONFIG_MIRILLA_AEC_TARGET,
-                 CONFIG_MIRILLA_METER_CENTER_PCT > 0 ? "central" : "frame completo",
                  MIRILLA_BAND_FILTER ? "on" : "off",
                  CONFIG_MIRILLA_EXPOSURE_GUARD_S);
+
+        /*
+         * La ventana se relee del sensor en vez de recalcularla: es el unico
+         * sitio donde se ve lo que quedo escrito de verdad, y es el ajuste del
+         * que depende que el AEC mida la escena o el tunel negro.
+         */
+        const int win_x = reg_read16(sensor, OV5640_REG_AVG_X_START);
+        const int win_y = reg_read16(sensor, OV5640_REG_AVG_Y_START);
+        const int win_w = reg_read16(sensor, OV5640_REG_AVG_X_WINDOW);
+        const int win_h = reg_read16(sensor, OV5640_REG_AVG_Y_WINDOW);
+        if (win_x < 0 || win_y < 0 || win_w <= 0 || win_h <= 0) {
+            ESP_LOGW(TAG, "no se pudo releer la ventana de medicion del AEC");
+        } else {
+            ESP_LOGI(TAG, "ventana de medicion: %dx%d en (%d,%d), centro (%d,%d); "
+                          "el circulo de la optica esta en (%u,%u) con radio %u",
+                     win_w, win_h, win_x, win_y,
+                     win_x + win_w / 2, win_y + win_h / 2,
+                     (unsigned) (s_mode.out_w / 2), (unsigned) (s_mode.out_h * 47 / 100),
+                     (unsigned) (s_mode.out_h * 21 / 100));
+        }
     } else {
         ESP_LOGE(TAG, "politica de exposicion NO confirmada: el sensor se queda con los "
                       "limites por defecto del driver y la escena saldra oscura");
