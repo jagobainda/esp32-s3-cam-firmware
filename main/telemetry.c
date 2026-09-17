@@ -23,11 +23,6 @@
 
 static const char *TAG = "telemetry";
 
-/*
- * Rango de medida del sensor interno. El hardware tiene rangos predefinidos y
- * cruzar la frontera de dos de ellos hace que el driver rechace la
- * configuracion, asi que se elige de una lista cerrada en Kconfig.
- */
 #if CONFIG_MIRILLA_TSENS_RANGE_50_125
 #define TSENS_MIN 50
 #define TSENS_MAX 125
@@ -45,11 +40,6 @@ static const char *TAG = "telemetry";
 #define TSENS_MAX 20
 #endif
 
-/*
- * Escritor y lector son la misma tarea (uploader): publica las cifras al
- * cerrar la ventana estadistica y las lee al componer la cabecera del
- * siguiente frame. Por eso no hay cerrojo aqui.
- */
 static mirilla_telemetry_loop_t s_loop;
 
 #if CONFIG_MIRILLA_TELEMETRY_ENABLED
@@ -87,10 +77,6 @@ esp_err_t mirilla_telemetry_init(void)
     const temperature_sensor_config_t config =
         TEMPERATURE_SENSOR_CONFIG_DEFAULT(TSENS_MIN, TSENS_MAX);
 
-    /*
-     * Que falle el sensor de temperatura no puede tumbar la subida de video:
-     * se avisa y el resto de la telemetria sigue viajando sin el campo.
-     */
     esp_err_t err = temperature_sensor_install(&config, &s_tsens);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "sensor de temperatura no instalado (%s), se omitira",
@@ -136,7 +122,6 @@ size_t mirilla_telemetry_device(char *out, size_t len)
 
     if (s_tsens != NULL) {
         float celsius = 0.0f;
-        /* Fuera de rango devuelve ESP_FAIL: mejor omitir el campo que mentir. */
         if (temperature_sensor_get_celsius(s_tsens, &celsius) == ESP_OK) {
             written += snprintf(out + written, len - written, "t=%.1f;", celsius);
         }
@@ -148,12 +133,6 @@ size_t mirilla_telemetry_device(char *out, size_t len)
                             ap.rssi, (unsigned) ap.primary);
     }
 
-    /*
-     * Estado del AEC. Es lo que explica un FPS bajo sin tocar nada mas: el
-     * ritmo no puede pasar de 1000/frm, y si exp ha llegado a expmax con la
-     * ganancia arriba y avg por debajo del objetivo, el control esta topado.
-     * Sin esto habria que abrir la puerta y enchufar el USB para verlo.
-     */
     mirilla_camera_aec_t aec;
     mirilla_camera_aec(&aec);
     if (aec.valid) {
@@ -174,7 +153,6 @@ size_t mirilla_telemetry_device(char *out, size_t len)
         s_loop.fps, s_loop.capture_ms, s_loop.upload_ms,
         s_loop.frames_ok, s_loop.frames_failed);
 
-    /* snprintf trunca en silencio; si no cabe entero preferimos no mandar nada. */
     if (written < 0 || (size_t) written >= len) {
         ESP_LOGW(TAG, "cabecera de telemetria truncada (%d bytes), se omite", written);
         return 0;
@@ -204,7 +182,6 @@ size_t mirilla_telemetry_board(char *out, size_t len)
 
     const esp_app_desc_t *app = esp_app_get_description();
 
-    /* Se acotan version e idf: vienen de git y pueden llegar a 32 bytes cada una. */
     const int written = snprintf(
         out, len,
         "rev=v%d.%d;cores=%d;psram=%u;flash=%" PRIu32 ";"

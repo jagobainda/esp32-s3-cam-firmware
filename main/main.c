@@ -1,10 +1,3 @@
-/*
- * Mirilla electronica - firmware de captura y subida.
- *
- * Placa: Waveshare ESP32-S3-CAM-OV5640 (ESP32-S3R8, 8MB PSRAM Octal).
- * Captura JPEG por DVP y lo sube por HTTP POST a un servidor de la LAN.
- */
-
 #include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"

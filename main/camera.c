@@ -13,11 +13,6 @@
 
 static const char *TAG = "camera";
 
-/* ---------------------------------------------------------------------------
- * Pinout DVP de la Waveshare ESP32-S3-CAM-OV5640 (SKU 33699).
- * Contrastado entre los ejemplos oficiales 04_dvp_camera_display y
- * 05_lvgl_brookesia, que coinciden pin a pin.
- * ------------------------------------------------------------------------ */
 #define CAM_PIN_XCLK   GPIO_NUM_38
 #define CAM_PIN_PCLK   GPIO_NUM_41
 #define CAM_PIN_VSYNC  GPIO_NUM_17
@@ -31,11 +26,9 @@ static const char *TAG = "camera";
 #define CAM_PIN_D6     GPIO_NUM_39
 #define CAM_PIN_D7     GPIO_NUM_21
 
-/* PWDN y RESET no estan cableados en esta variante de la placa. */
 #define CAM_PIN_PWDN   GPIO_NUM_NC
 #define CAM_PIN_RESET  GPIO_NUM_NC
 
-/* SCCB: bus I2C compartido con el resto de perifericos, no uno dedicado. */
 #define CAM_I2C_PORT   I2C_NUM_0
 #define CAM_PIN_SCL    GPIO_NUM_7
 #define CAM_PIN_SDA    GPIO_NUM_8
@@ -54,75 +47,6 @@ static const char *TAG = "camera";
 static i2c_master_bus_handle_t s_i2c_bus;
 static int64_t s_exposure_guard_next_us;
 
-/* ---------------------------------------------------------------------------
- * Politica de exposicion del OV5640.
- *
- * El sensor arranca con el modo nocturno activado (0x3a00 bit 2) y con los
- * limites del AEC que trae la tabla por defecto del driver esp32-camera,
- * calculados para otro modo de video. En 1080p JPEG con XCLK de 20MHz el modo
- * que corre de verdad es este:
- *
- *   SYSCLK 50MHz, HTS 2844, VTS 1488 -> linea 56.9us, frame 84.6ms (11.8 FPS)
- *
- * y los limites que quedan puestos, estos:
- *
- *   techo de exposicion (0x3a02/03 y 0x3a14/15) = 0x03d8 = 984 lineas = 56ms
- *   techo de ganancia   (0x3a18/19)             = 0x00f8 = 15.5x
- *   pasos de banda      (0x3a08..0x3a0b)        = 295 y 246 lineas, cuando los
- *                                                 reales aqui son 175 (50Hz)
- *                                                 y 146 (60Hz)
- *
- * O sea: el AEC no puede pasar de 56ms x 15.5x aunque el frame dure 84.6ms, y
- * encima cuantiza la exposicion con pasos de banda de otro modo. En la mirilla
- * eso pesa mas de lo que parece, porque la optica solo proyecta un circulo que
- * ocupa ~10% del frame y el resto es negro: la media que mide el AEC no puede
- * alcanzar su objetivo por mucho que exponga, asi que el control se queda
- * pegado al techo y la imagen es, literalmente, "lo que de el techo".
- *
- * Aqui se reprograman los limites para el modo que esta corriendo (formulas
- * del datasheet, las mismas que usa drivers/media/i2c/ov5640.c en Linux) y se
- * elige que hace el sensor cuando se queda sin luz:
- *
- *   MODO DIA    modo nocturno off, el frame nunca se alarga: dura siempre
- *               HTS x VTS. El ritmo es fijo pase lo que pase. Es el default.
- *   MODO NOCHE  modo nocturno on: el AEC alarga el frame con lineas de
- *               relleno para exponer mas tiempo. Cuesta FPS de verdad.
- *
- * Sobre el coste del modo noche, porque este comentario decia lo contrario y
- * costo 2.5 FPS: el techo de exposicion NO es un suelo de FPS.
- *
- *   1) A 1080p el driver DVP entrega un frame de cada DOS del sensor. Medido
- *      con el benchmark de captura pura en esta placa: frame de 84.63ms
- *      (11.81 FPS de sensor) y llegan 169ms clavados, min = max, 5.81 FPS.
- *      Alargar el frame del sensor 1ms cuesta 2ms de periodo.
- *   2) El bucle de subida es secuencial (esperar frame, subirlo), asi que
- *      encima el periodo es entrega + subida, no el mayor de los dos.
- *
- * De ahi salieron los 2.5 FPS: con el techo en 150ms el sensor se iba a ~200ms
- * de frame, el DVP lo doblaba a 400ms y el bucle quedaba clavado en 2.5. El
- * suelo real del modo noche no es 1000/MAX_EXPOSURE_MS, es la mitad.
- *
- * Por eso el techo se recorta al periodo del FPS objetivo dividido por esa
- * relacion, y por eso la duracion real del frame se lee del sensor y viaja en
- * la telemetria: con la placa montada en la puerta no hay USB, y sin ese dato
- * esto se manifiesta como un FPS bajo sin causa aparente.
- *
- * Registros implicados, todos del datasheet del OV5640:
- *   0x3034..0x3037, 0x3108  divisores del PLL, para calcular SYSCLK
- *   0x3808/0x380a           tamano de salida (para la ventana de medicion)
- *   0x380c/0x380e           HTS / VTS del modo actual
- *   0x3500..0x3502          exposicion en lineas (20 bits, 4 de fraccion)
- *   0x350a/0x350b           ganancia real, formato 6.4 (16 unidades = 1x)
- *   0x350c/0x350d           lineas de relleno que anade el modo nocturno
- *   0x3a00                  bit 2 modo nocturno, bit 5 filtro de banda
- *   0x3a02/03 y 0x3a14/15   techo de exposicion (60Hz y 50Hz)
- *   0x3a08..0x3a0b          paso de banda de 50Hz y de 60Hz
- *   0x3a0d/0x3a0e           numero maximo de bandas (60Hz y 50Hz)
- *   0x3a0f,10,11,1b,1e,1f   nivel medio objetivo del AEC y sus margenes
- *   0x3a18/0x3a19           techo de ganancia
- *   0x5680..0x5687          ventana sobre la que el AEC promedia
- *   0x56a1                  media medida (solo lectura, para el diagnostico)
- * ------------------------------------------------------------------------ */
 #define OV5640_REG_SC_PLL_CTRL0     0x3034
 #define OV5640_REG_SC_PLL_CTRL1     0x3035
 #define OV5640_REG_SC_PLL_CTRL2     0x3036
@@ -157,16 +81,8 @@ static int64_t s_exposure_guard_next_us;
 #define OV5640_REG_AVG_Y_WINDOW     0x5686
 #define OV5640_REG_AVG_READOUT      0x56a1
 
-/* El techo de exposicion y el VTS son campos de 12 bits en el sensor. */
 #define OV5640_MAX_EXPOSURE_LINES   0x0fff
-/*
- * Frames del sensor por cada frame que entrega el driver DVP. A 1080p es 2,
- * medido: el sensor va a 84.63ms y esp_camera_fb_get() devuelve uno cada
- * 169ms, sin dispersion. Es lo que convierte la duracion del frame en el techo
- * de FPS del aparato entero.
- */
 #define MIRILLA_SENSOR_FRAMES_PER_CAPTURE 2
-/* Ganancia real en formato 6.4: 16 unidades = 1x, tope del registro 0x3ff. */
 #define OV5640_GAIN_UNITS_PER_X     16
 #define OV5640_MAX_GAIN_UNITS       0x03ff
 
@@ -184,7 +100,6 @@ static int64_t s_exposure_guard_next_us;
 #define MIRILLA_BAND_FILTER    0
 #endif
 
-/* Parametros del modo que esta corriendo, leidos del sensor una sola vez. */
 typedef struct {
     uint32_t sysclk_hz;
     uint16_t hts;
@@ -208,12 +123,6 @@ static int reg_read16(sensor_t *sensor, uint16_t reg)
     return sensor->get_reg(sensor, reg, 0xffff);
 }
 
-/*
- * Escribe solo si hace falta y relee para confirmar: una escritura SCCB
- * perdida no debe pasar inadvertida. Devuelve false si no se pudo dejar el
- * registro como se pedia, y marca `fixed` si hubo que tocarlo (al arrancar es
- * lo normal; mas tarde significa que algo lo habia cambiado).
- */
 static bool reg_ensure(sensor_t *sensor, uint16_t reg, uint16_t mask, uint16_t value, bool *fixed)
 {
     const int current = sensor->get_reg(sensor, reg, mask);
@@ -233,12 +142,6 @@ static bool reg_ensure(sensor_t *sensor, uint16_t reg, uint16_t mask, uint16_t v
     return after >= 0 && (after & mask) == (value & mask);
 }
 
-/*
- * SYSCLK a partir de los divisores del PLL, tal cual lo documenta OmniVision.
- * De el salen el reloj de linea, el techo de exposicion en lineas y los pasos
- * del filtro de banda; sin calcularlo hay que adivinarlos, que es justo lo que
- * hace la tabla por defecto del driver.
- */
 static uint32_t exposure_sysclk_hz(sensor_t *sensor)
 {
     static const uint32_t sclk_rdiv_map[] = { 1, 2, 4, 8 };
@@ -252,7 +155,6 @@ static uint32_t exposure_sysclk_hz(sensor_t *sensor)
         return 0;
     }
 
-    /* 0x3034[3:0]: 8 y 10 son bits por pixel y dividen; el resto no. */
     const uint32_t bits = (uint32_t) (ctrl0 & 0x0f);
     const uint32_t bit_div2x = (bits == 8 || bits == 10) ? bits / 2 : 1;
     const uint32_t sysdiv = (ctrl1 >> 4) ? (uint32_t) (ctrl1 >> 4) : 16;
@@ -265,13 +167,11 @@ static uint32_t exposure_sysclk_hz(sensor_t *sensor)
         return 0;
     }
 
-    /* En unidades de 10kHz para que el VCO no desborde 32 bits. */
     const uint32_t xvclk = (uint32_t) CONFIG_MIRILLA_XCLK_FREQ_HZ / 10000;
     const uint32_t vco = xvclk * multiplier / prediv;
     return vco / sysdiv / pll_rdiv * 2 / bit_div2x / sclk_rdiv * 10000;
 }
 
-/* Geometria y reloj del modo actual, leidos del propio sensor. */
 static bool exposure_mode_read(sensor_t *sensor, exposure_mode_t *mode)
 {
     const uint32_t sysclk_hz = exposure_sysclk_hz(sensor);
@@ -293,17 +193,6 @@ static bool exposure_mode_read(sensor_t *sensor, exposure_mode_t *mode)
         return false;
     }
 
-    /*
-     * Techo de exposicion. En modo dia no tiene sentido pedir mas de un frame:
-     * el sensor no puede exponer mas de VTS-4 lineas sin alargarlo, y
-     * alargarlo es precisamente lo que hace el modo nocturno.
-     *
-     * En modo noche el recorte es el periodo del FPS objetivo repartido entre
-     * los frames de sensor que cuesta cada captura. No garantiza ese ritmo (la
-     * subida va detras, en el mismo bucle), pero impide lo que no tiene
-     * defensa posible: pedir una exposicion que por si sola ya se pasa del
-     * periodo objetivo.
-     */
     uint32_t lines = (uint32_t) CONFIG_MIRILLA_MAX_EXPOSURE_MS * 1000000UL / mode->line_ns;
     if (!MIRILLA_NIGHT_MODE && lines > (uint32_t) mode->vts - 4) {
         lines = (uint32_t) mode->vts - 4;
@@ -331,17 +220,11 @@ static bool exposure_mode_read(sensor_t *sensor, exposure_mode_t *mode)
     return true;
 }
 
-/* Duracion en microsegundos de un numero de lineas del modo actual. */
 static uint32_t exposure_lines_to_us(uint32_t lines)
 {
     return (uint32_t) ((uint64_t) lines * s_mode.line_ns / 1000);
 }
 
-/*
- * Deja el bloque AEC/AGC como pide la configuracion. Idempotente a proposito:
- * se llama al arrancar y luego cada MIRILLA_EXPOSURE_GUARD_S segundos, y en el
- * caso normal son solo lecturas.
- */
 static bool exposure_policy_apply(sensor_t *sensor, bool *fixed)
 {
     if (fixed != NULL) {
@@ -356,17 +239,9 @@ static bool exposure_policy_apply(sensor_t *sensor, bool *fixed)
 
     bool ok = true;
 
-    /* Techo de exposicion, en las dos variantes (60Hz y 50Hz) que mira el AEC. */
     ok &= reg_ensure(sensor, OV5640_REG_AEC_MAX_EXP_60, 0x0fff, s_mode.max_exposure_lines, fixed);
     ok &= reg_ensure(sensor, OV5640_REG_AEC_MAX_EXP_50, 0x0fff, s_mode.max_exposure_lines, fixed);
 
-    /*
-     * Filtro de banda: cuantiza la exposicion en multiplos de medio ciclo de
-     * la red para que la luz artificial no deje bandas horizontales. El paso
-     * depende del reloj de linea, asi que hay que recalcularlo para este modo,
-     * y el numero maximo de bandas es lo que limita la exposicion mientras el
-     * filtro esta activo.
-     */
 #if MIRILLA_BAND_FILTER
     const uint32_t band_step_50 = s_mode.sysclk_hz / ((uint32_t) s_mode.hts * 100);
     const uint32_t band_step_60 = s_mode.sysclk_hz / ((uint32_t) s_mode.hts * 120);
@@ -389,18 +264,12 @@ static bool exposure_policy_apply(sensor_t *sensor, bool *fixed)
     ok &= reg_ensure(sensor, OV5640_REG_AEC_CTRL00, OV5640_BAND_FILTER_BIT,
                      MIRILLA_BAND_FILTER ? OV5640_BAND_FILTER_BIT : 0, fixed);
 
-    /* Techo de ganancia analogica, en formato 6.4. */
     uint32_t gain_units = (uint32_t) CONFIG_MIRILLA_GAIN_CEILING_X * OV5640_GAIN_UNITS_PER_X;
     if (gain_units > OV5640_MAX_GAIN_UNITS) {
         gain_units = OV5640_MAX_GAIN_UNITS;
     }
     ok &= reg_ensure(sensor, OV5640_REG_AEC_GAIN_CEILING, 0x03ff, (uint16_t) gain_units, fixed);
 
-    /*
-     * Nivel medio objetivo del AEC y su histeresis, con las proporciones que
-     * documenta OmniVision: +-8% de zona estable, y el doble y la mitad para
-     * decidir cuando corregir de golpe en vez de poco a poco.
-     */
     uint32_t high = (uint32_t) CONFIG_MIRILLA_AEC_TARGET * 27 / 25;
     uint32_t low = (uint32_t) CONFIG_MIRILLA_AEC_TARGET * 23 / 25;
     if (high > 0xff) high = 0xff;
@@ -416,13 +285,6 @@ static bool exposure_policy_apply(sensor_t *sensor, bool *fixed)
     ok &= reg_ensure(sensor, OV5640_REG_AEC_FAST_HIGH, 0xff, (uint16_t) fast_high, fixed);
     ok &= reg_ensure(sensor, OV5640_REG_AEC_FAST_LOW, 0xff, (uint16_t) fast_low, fixed);
 
-    /*
-     * Ventana de medicion. El AEC promedia esta region y la compara con el
-     * objetivo; por defecto abarca el frame entero, y en la mirilla eso es
-     * medir sobre todo el negro que rodea al circulo de la optica. Un cuadrado
-     * centrado del tamano del circulo hace que el AEC regule por la escena de
-     * verdad en vez de quedarse pegado al techo.
-     */
 #if CONFIG_MIRILLA_METER_CENTER_PCT > 0
     uint32_t side = (uint32_t) s_mode.out_h * CONFIG_MIRILLA_METER_CENTER_PCT / 100;
     if (side > s_mode.out_w) {
@@ -439,39 +301,20 @@ static bool exposure_policy_apply(sensor_t *sensor, bool *fixed)
     ok &= reg_ensure(sensor, OV5640_REG_AVG_Y_WINDOW, 0xffff, (uint16_t) side, fixed);
 #endif
 
-    /* Y al final el modo nocturno, que es quien decide si el frame se alarga. */
     ok &= reg_ensure(sensor, OV5640_REG_AEC_CTRL00, OV5640_NIGHT_MODE_BIT,
                      MIRILLA_NIGHT_MODE ? OV5640_NIGHT_MODE_BIT : 0, fixed);
     if (!MIRILLA_NIGHT_MODE) {
-        /* Sin modo nocturno nadie deberia estar anadiendo lineas de relleno. */
         ok &= reg_ensure(sensor, OV5640_REG_VTS_EXTRA, 0xffff, 0, fixed);
     }
 
     if (ok) {
-        /* Que el status del driver no contradiga a los registros. */
         sensor->status.aec2 = MIRILLA_NIGHT_MODE;
     }
     return ok;
 }
 
-/*
- * Que ha elegido el AEC ahora mismo. Es el diagnostico que dice si la escena
- * sale oscura porque no hay luz o porque el control esta topado: si exposicion
- * y ganancia estan en su techo y la media medida sigue por debajo del
- * objetivo, es lo segundo y hay margen subiendo los techos.
- *
- * `frame_ms` es ademas el unico sitio donde se ve la duracion real del frame,
- * que es lo que fija el techo de FPS de todo el aparato. Por eso esto se lee
- * siempre, se registre o no en el log: viaja en la telemetria, y con la placa
- * montada en la puerta la telemetria es la unica ventana que hay.
- */
 static void exposure_sample_state(sensor_t *sensor)
 {
-    /*
-     * 0x3501/0x3502 son los 16 bits bajos del campo de 20: lineas en los 12
-     * altos y fraccion de linea en los 4 bajos. Con el techo limitado a 12
-     * bits de lineas, 0x3500 siempre es cero y no hace falta leerlo.
-     */
     const int exposure = reg_read16(sensor, OV5640_REG_EXPOSURE_MID);
     const int gain = reg_read16(sensor, OV5640_REG_GAIN);
     const int vts_extra = reg_read16(sensor, OV5640_REG_VTS_EXTRA);
@@ -545,11 +388,6 @@ const char *mirilla_camera_resolution_str(void)
     return MIRILLA_FRAMESIZE_STR;
 }
 
-/*
- * El driver esp32-camera compilado contra IDF >= 5.4 usa sccb-ng.c, que
- * recupera el bus con i2c_master_get_bus_handle(port). Por eso hay que crear
- * el bus con la API nueva (i2c_new_master_bus) y no con la legacy.
- */
 static esp_err_t sccb_bus_init(void)
 {
     const i2c_master_bus_config_t bus_config = {
@@ -582,7 +420,6 @@ esp_err_t mirilla_camera_init(void)
         .pin_pwdn = CAM_PIN_PWDN,
         .pin_reset = CAM_PIN_RESET,
         .pin_xclk = CAM_PIN_XCLK,
-        /* -1 en sda le dice al driver que use sccb_i2c_port en vez de pines. */
         .pin_sccb_sda = GPIO_NUM_NC,
         .pin_sccb_scl = GPIO_NUM_NC,
         .pin_d7 = CAM_PIN_D7,
@@ -620,8 +457,6 @@ esp_err_t mirilla_camera_init(void)
         return ESP_FAIL;
     }
 
-    /* Reintentos: los primeros accesos SCCB tras configurar el sensor a veces
-       fallan, y de esto no queremos quedarnos sin saber si cuajo. */
     bool applied = false;
     for (int attempt = 1; attempt <= 3 && !applied; attempt++) {
         applied = exposure_policy_apply(sensor, NULL);
@@ -656,14 +491,6 @@ esp_err_t mirilla_camera_init(void)
                                (int64_t) CONFIG_MIRILLA_EXPOSURE_GUARD_S * 1000000LL;
 
 #if CONFIG_MIRILLA_ROTATE_180
-    /*
-     * La placa va montada boca abajo en la mirilla, asi que la imagen sale
-     * invertida. Un giro de 180 grados es vflip + hmirror, y el OV5640 los
-     * aplica en su propio ISP antes de comprimir: son escrituras I2C una sola
-     * vez al arrancar, sin coste por frame ni perdida de calidad. La
-     * alternativa (girarlo en el servidor) obligaria a descodificar y
-     * recomprimir cada JPEG de 1080p.
-     */
     if (sensor->set_vflip == NULL || sensor->set_hmirror == NULL) {
         ESP_LOGW(TAG, "el sensor no expone vflip/hmirror, imagen sin girar");
     } else if (sensor->set_vflip(sensor, 1) != 0 || sensor->set_hmirror(sensor, 1) != 0) {
@@ -724,8 +551,6 @@ void mirilla_camera_benchmark(int seconds)
              frames ? (double) bytes / frames / 1024.0 : 0.0,
              min_gap == INT64_MAX ? 0 : min_gap / 1000, max_gap / 1000);
 
-    /* Tras el benchmark el AEC ya ha convergido: es el mejor momento para ver
-       con que exposicion y ganancia se ha quedado. */
     sensor_t *sensor = esp_camera_sensor_get();
     if (sensor != NULL && s_mode.line_ns != 0) {
         exposure_sample_state(sensor);

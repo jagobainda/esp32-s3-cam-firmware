@@ -1,19 +1,12 @@
-# ---------------------------------------------------------------------------
-# Mirilla electronica - Waveshare ESP32-S3-CAM-OV5640 (ESP32-S3R8)
-# ---------------------------------------------------------------------------
-
 CONFIG_IDF_TARGET="esp32s3"
 
-# --- CPU -------------------------------------------------------------------
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
-# --- Flash externa: 16MB ---------------------------------------------------
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
 
-# --- PSRAM Octal 8MB (imprescindible para framebuffers a 1080p) ------------
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_TYPE_AUTO=y
@@ -23,25 +16,20 @@ CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 CONFIG_SPIRAM_IGNORE_NOTFOUND=n
 
-# --- Tareas ----------------------------------------------------------------
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
 
-# --- Wi-Fi: buffers holgados para sostener subida continua de JPEG ---------
 CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=64
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
 CONFIG_ESP_WIFI_TX_BA_WIN=16
 CONFIG_ESP_WIFI_RX_BA_WIN=16
 
-# --- lwIP: TCP orientado a throughput de subida ----------------------------
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
 CONFIG_LWIP_TCP_WND_DEFAULT=65535
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
 
-# --- esp32-camera ----------------------------------------------------------
 CONFIG_OV5640_SUPPORT=y
 CONFIG_SCCB_HARDWARE_I2C_PORT0=y
 
-# --- Log -------------------------------------------------------------------
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y

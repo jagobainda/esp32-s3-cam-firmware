@@ -21,7 +21,6 @@ static const char *TAG = "uploader";
 #define FRAME_PERIOD_US (1000000LL / CONFIG_MIRILLA_TARGET_FPS)
 #define STATS_WINDOW_US ((int64_t) CONFIG_MIRILLA_STATS_WINDOW_S * 1000000LL)
 
-/* Estadistica acumulada dentro de la ventana movil. */
 typedef struct {
     int64_t window_start_us;
     uint32_t frames_ok;
@@ -40,8 +39,6 @@ static void stats_reset(stats_t *s, int64_t now_us)
     s->bytes_min = UINT32_MAX;
 }
 
-/* Acumulados de toda la vida del programa, no de la ventana: la ventana se
-   reinicia cada MIRILLA_STATS_WINDOW_S y el servidor quiere el total. */
 static uint32_t s_total_ok;
 static uint32_t s_total_failed;
 
@@ -73,8 +70,6 @@ static void stats_report(const stats_t *s, int64_t now_us)
              s->frames_ok ? (double) s->capture_us / s->frames_ok / 1000.0 : 0.0,
              s->frames_ok ? (double) s->upload_us / s->frames_ok / 1000.0 : 0.0);
 
-    /* Los mismos numeros que acaban de ir al log viajan al servidor en la
-       cabecera del siguiente frame, que es donde alguien los va a ver. */
     const mirilla_telemetry_loop_t loop = {
         .fps = (float) fps,
         .capture_ms = s->frames_ok
@@ -87,7 +82,6 @@ static void stats_report(const stats_t *s, int64_t now_us)
     mirilla_telemetry_set_loop(&loop);
 }
 
-/* Descarta el cuerpo de la respuesta; solo nos interesa el codigo de estado. */
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
     (void) evt;
@@ -121,9 +115,6 @@ static esp_http_client_handle_t make_client(void)
     esp_http_client_set_header(client, "Content-Type", "image/jpeg");
     esp_http_client_set_header(client, "X-API-Key", CONFIG_MIRILLA_API_KEY);
 
-    /* Los datos de placa no cambian nunca, asi que basta fijar la cabecera una
-       vez: el cliente conserva la lista entre peticiones y la reenvia en todas
-       sin volver a gastar CPU en componerla. */
     char board[MIRILLA_TELEMETRY_HEADER_MAX];
     if (mirilla_telemetry_board(board, sizeof(board)) > 0) {
         esp_http_client_set_header(client, MIRILLA_TELEMETRY_HEADER_BOARD, board);
@@ -161,7 +152,6 @@ static void uploader_task(void *arg)
         if (!mirilla_wifi_is_connected()) {
             ESP_LOGW(TAG, "sin Wi-Fi, esperando reconexion");
             mirilla_wifi_wait_connected(0);
-            /* La conexion TCP anterior ya no sirve tras caerse el enlace. */
             esp_http_client_close(client);
             stats_reset(&stats, esp_timer_get_time());
             continue;
@@ -177,9 +167,6 @@ static void uploader_task(void *arg)
             continue;
         }
 
-        /* Justo antes del envio, para que el dato sea lo mas fresco posible.
-           La latencia de subida es la excepcion: describe la ventana anterior,
-           porque la de este frame todavia no ha ocurrido. */
         char device[MIRILLA_TELEMETRY_HEADER_MAX];
         if (mirilla_telemetry_device(device, sizeof(device)) > 0) {
             esp_http_client_set_header(client, MIRILLA_TELEMETRY_HEADER_DEVICE, device);
@@ -213,7 +200,6 @@ static void uploader_task(void *arg)
             ESP_LOGE(TAG, "frame %lu: %lu bytes, fallo de subida (%s, HTTP %d)",
                      (unsigned long) frame_index, (unsigned long) len,
                      esp_err_to_name(err), status);
-            /* Fuerza reapertura de socket en el siguiente intento. */
             esp_http_client_close(client);
         }
 
@@ -225,16 +211,12 @@ static void uploader_task(void *arg)
             stats_reset(&stats, now_us);
         }
 
-        /* Al final del ciclo, no entre captura y subida: si toca revisar la
-           exposicion, el I2C se come tiempo de espera y no de latencia. */
         mirilla_camera_keep_exposure_policy();
 
-        /* Ritmo objetivo: dormimos solo lo que sobre del periodo. */
         const int64_t spent_us = esp_timer_get_time() - cycle_start_us;
         if (spent_us < FRAME_PERIOD_US) {
             vTaskDelay(pdMS_TO_TICKS((FRAME_PERIOD_US - spent_us) / 1000));
         } else {
-            /* Cede CPU aunque vayamos tarde, para no matar de hambre a otras tareas. */
             vTaskDelay(1);
         }
     }
@@ -242,7 +224,6 @@ static void uploader_task(void *arg)
 
 esp_err_t mirilla_uploader_start(void)
 {
-    /* Pila holgada: esp_http_client + mbedtls-free path aun asi usa bastante. */
     if (xTaskCreate(uploader_task, "uploader", 6144, NULL, 5, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }

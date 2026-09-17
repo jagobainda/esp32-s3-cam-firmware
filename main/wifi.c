@@ -20,11 +20,6 @@ static const char *TAG = "wifi";
 static EventGroupHandle_t s_wifi_events;
 static int s_retry_count;
 
-/*
- * La reconexion vive en su propia tarea y no en el handler de eventos: el
- * backoff necesita dormir, y dormir dentro del handler bloquearia el event
- * loop del sistema entero.
- */
 static void wifi_reconnect_task(void *arg)
 {
     (void) arg;
@@ -122,10 +117,6 @@ esp_err_t mirilla_wifi_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
 
-    /*
-     * Subimos JPEG grandes de forma continua: sin ahorro de energia el
-     * throughput es notablemente mas estable.
-     */
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
     if (xTaskCreate(wifi_reconnect_task, "wifi_reconn", 3072, NULL, 5, NULL) != pdPASS) {
